@@ -1,0 +1,1830 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <array>
+#include <cstdlib>
+#include <unordered_set>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <span>
+
+#include <fstream>
+#include <variant>
+
+#ifdef ARCHITECTURE_x86_64
+#include "common/x64/xbyak.h"
+#include "video_core/macro_turing_jit.h"
+#endif
+
+#include "common/assert.h"
+#include "common/scope_exit.h"
+#include "common/fs/fs.h"
+#include "common/fs/path_util.h"
+#include "common/settings.h"
+#include "core/core.h"
+#include "common/container_hash.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "video_core/mesh_count_provenance.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "video_core/dirty_flags.h"
+#include "video_core/memory_manager.h"
+#include "video_core/rasterizer_interface.h"
+#include "video_core/macro.h"
+#include "video_core/dma_pusher.h"
+
+#include "common/assert.h"
+#include "common/bit_field.h"
+#include "common/logging.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_split.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/query_dma.h"
+
+namespace Tegra {
+
+using Maxwell3D = Engines::Maxwell3D;
+
+namespace {
+
+// Private diagnostic: no work beyond this empty-path check unless explicitly enabled.
+class OotCullTrace {
+public:
+    static constexpr u32 MaxRecords = 65536;
+    static constexpr u64 MaxFrames = 16;
+
+    explicit OotCullTrace(const char* path) : prefix{path ? path : ""} {}
+
+    bool Enabled() const noexcept { return !prefix.empty(); }
+
+    u64 BeginCall(u64 present, bool is_oot) {
+        if (prefix.empty() || !is_oot) return 0;
+        if (active && (present < first_present || present - first_present >= MaxFrames)) {
+            Finish(present, "frame_limit");
+        }
+        if (!active && present != last_poll && capture_index < 8) {
+            last_poll = present;
+            const std::filesystem::path marker{prefix + ".now"};
+            const std::filesystem::path output{
+                fmt::format("{}-{:02}.jsonl", prefix, capture_index)};
+            std::error_code error;
+            if (std::filesystem::exists(marker, error) &&
+                !std::filesystem::exists(output, error)) {
+                file.clear();
+                file.open(output, std::ios::out | std::ios::binary);
+                if (file) {
+                    std::filesystem::remove(marker, error);
+                    active = true;
+                    first_present = present;
+                    records = 0;
+                    ++capture_index;
+                    file << fmt::format(
+                        R"({{"kind":"cull_trace","guest_present":{},"max_frames":{},"max_records":{},"source":"native_macro_cpu_words"}})",
+                        present, MaxFrames, MaxRecords) << '\n';
+                }
+            }
+        }
+        return active ? ++call_serial : 0;
+    }
+
+    void Write(u64 call, u64 present, u32 macro, std::string_view fields) {
+        if (!active || call == 0) return;
+        if (present < first_present || present - first_present >= MaxFrames) {
+            Finish(present, "frame_limit");
+            return;
+        }
+        file << fmt::format(R"({{"guest_present":{},"call":{},"macro":"{:#x}",)",
+                            present, call, macro) << fields << "}\n";
+        if (++records >= MaxRecords) Finish(present, "record_limit");
+    }
+
+private:
+    void Finish(u64 present, const char* reason) {
+        file << fmt::format(
+            R"({{"kind":"cull_trace_end","guest_present":{},"records":{},"reason":"{}"}})",
+            present, records, reason) << '\n';
+        file.close();
+        active = false;
+    }
+
+    std::string prefix;
+    std::ofstream file;
+    bool active{};
+    u64 first_present{}, last_poll{~u64{}}, call_serial{};
+    u32 records{}, capture_index{};
+};
+
+
+bool IsTopologySafe(Maxwell3D::Regs::PrimitiveTopology topology) {
+    switch (topology) {
+    case Maxwell3D::Regs::PrimitiveTopology::Points:
+    case Maxwell3D::Regs::PrimitiveTopology::Lines:
+    case Maxwell3D::Regs::PrimitiveTopology::LineLoop:
+    case Maxwell3D::Regs::PrimitiveTopology::LineStrip:
+    case Maxwell3D::Regs::PrimitiveTopology::Triangles:
+    case Maxwell3D::Regs::PrimitiveTopology::TriangleStrip:
+    case Maxwell3D::Regs::PrimitiveTopology::TriangleFan:
+    case Maxwell3D::Regs::PrimitiveTopology::LinesAdjacency:
+    case Maxwell3D::Regs::PrimitiveTopology::LineStripAdjacency:
+    case Maxwell3D::Regs::PrimitiveTopology::TrianglesAdjacency:
+    case Maxwell3D::Regs::PrimitiveTopology::TriangleStripAdjacency:
+    case Maxwell3D::Regs::PrimitiveTopology::Patches:
+        return true;
+    case Maxwell3D::Regs::PrimitiveTopology::Quads:
+    case Maxwell3D::Regs::PrimitiveTopology::QuadStrip:
+    case Maxwell3D::Regs::PrimitiveTopology::Polygon:
+    default:
+        return false;
+    }
+}
+
+} // Anonymous namespace
+
+void HLE_DrawArraysIndirect::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    auto topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(parameters[0]);
+    if (!maxwell3d.AnyParametersDirty() || !IsTopologySafe(topology)) {
+        Fallback(system, maxwell3d, parameters);
+        return;
+    }
+
+    auto& params = maxwell3d.draw_manager.indirect_state;
+    params.is_byte_count = false;
+    params.is_indexed = false;
+    params.include_count = false;
+    params.count_start_address = 0;
+    params.indirect_start_address = maxwell3d.GetMacroAddress(1);
+    params.buffer_size = 4 * sizeof(u32);
+    params.max_draw_counts = 1;
+    params.stride = 0;
+
+    if (extended) {
+        maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
+    }
+
+    maxwell3d.draw_manager.DrawArrayIndirect(maxwell3d, topology);
+
+    if (extended) {
+        maxwell3d.engine_state = Maxwell3D::EngineHint::None;
+        maxwell3d.replace_table.clear();
+    }
+}
+void HLE_DrawArraysIndirect::Fallback(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters) {
+    SCOPE_EXIT {
+        if (extended) {
+            maxwell3d.engine_state = Maxwell3D::EngineHint::None;
+            maxwell3d.replace_table.clear();
+        }
+    };
+    maxwell3d.RefreshParameters();
+    const u32 instance_count = (maxwell3d.GetRegisterValue(0xD1B) & parameters[2]);
+    auto topology = Maxwell3D::Regs::PrimitiveTopology(parameters[0]);
+    const u32 vertex_first = parameters[3];
+    const u32 vertex_count = parameters[1];
+    if (!IsTopologySafe(topology) && size_t(maxwell3d.GetMaxCurrentVertices()) < size_t(vertex_first) + size_t(vertex_count)) {
+        ASSERT(false && "Faulty draw!");
+        return;
+    }
+    const u32 base_instance = parameters[4];
+    if (extended) {
+        maxwell3d.regs.global_base_instance_index = base_instance;
+        maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
+    }
+    maxwell3d.draw_manager.DrawArray(maxwell3d, topology, vertex_first, vertex_count, base_instance, instance_count);
+    if (extended) {
+        maxwell3d.regs.global_base_instance_index = 0;
+        maxwell3d.engine_state = Maxwell3D::EngineHint::None;
+        maxwell3d.replace_table.clear();
+    }
+}
+
+void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    auto topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(parameters[0]);
+    if (!maxwell3d.AnyParametersDirty() || !IsTopologySafe(topology)) {
+        Fallback(system, maxwell3d, parameters);
+        return;
+    }
+
+    const u32 estimate = u32(maxwell3d.EstimateIndexBufferSize());
+    const u32 element_base = parameters[4];
+    const u32 base_instance = parameters[5];
+    maxwell3d.regs.vertex_id_base = element_base;
+    maxwell3d.regs.global_base_vertex_index = element_base;
+    maxwell3d.regs.global_base_instance_index = base_instance;
+    maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (extended) {
+        maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
+    }
+    auto& params = maxwell3d.draw_manager.indirect_state;
+    params.is_byte_count = false;
+    params.is_indexed = true;
+    params.include_count = false;
+    params.count_start_address = 0;
+    params.indirect_start_address = maxwell3d.GetMacroAddress(1);
+    params.buffer_size = 5 * sizeof(u32);
+    params.max_draw_counts = 1;
+    params.stride = 0;
+    maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    maxwell3d.draw_manager.DrawIndexedIndirect(maxwell3d, topology, 0, estimate);
+    maxwell3d.regs.vertex_id_base = 0x0;
+    maxwell3d.regs.global_base_vertex_index = 0x0;
+    maxwell3d.regs.global_base_instance_index = 0x0;
+    if (extended) {
+        maxwell3d.engine_state = Maxwell3D::EngineHint::None;
+        maxwell3d.replace_table.clear();
+    }
+}
+void HLE_DrawIndexedIndirect::Fallback(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters) {
+    maxwell3d.RefreshParameters();
+    const u32 instance_count = (maxwell3d.GetRegisterValue(0xD1B) & parameters[2]);
+    const u32 element_base = parameters[4];
+    const u32 base_instance = parameters[5];
+    maxwell3d.regs.vertex_id_base = element_base;
+    maxwell3d.regs.global_base_vertex_index = element_base;
+    maxwell3d.regs.global_base_instance_index = base_instance;
+    maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (extended) {
+        maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
+    }
+    maxwell3d.draw_manager.DrawIndex(maxwell3d, Tegra::Maxwell3D::Regs::PrimitiveTopology(parameters[0]), parameters[3], parameters[1], element_base, base_instance, instance_count);
+    maxwell3d.regs.vertex_id_base = 0x0;
+    maxwell3d.regs.global_base_vertex_index = 0x0;
+    maxwell3d.regs.global_base_instance_index = 0x0;
+    if (extended) {
+        maxwell3d.engine_state = Maxwell3D::EngineHint::None;
+        maxwell3d.replace_table.clear();
+    }
+}
+void HLE_MultiLayerClear::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    maxwell3d.RefreshParameters();
+    ASSERT(parameters.size() == 1);
+
+    const Maxwell3D::Regs::ClearSurface clear_params{parameters[0]};
+    const u32 rt_index = clear_params.RT;
+    const u32 num_layers = maxwell3d.regs.rt[rt_index].depth;
+    ASSERT(clear_params.layer == 0);
+
+    maxwell3d.regs.clear_surface.raw = clear_params.raw;
+    maxwell3d.draw_manager.Clear(maxwell3d, num_layers);
+}
+void HLE_MultiDrawIndexedIndirectCount::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    const auto topology = Maxwell3D::Regs::PrimitiveTopology(parameters[2]);
+    if (IsTopologySafe(topology)) {
+        const u32 start_indirect = parameters[0];
+        const u32 end_indirect = parameters[1];
+        if (start_indirect >= end_indirect) {
+            // Nothing to do.
+            return;
+        }
+        const u32 padding = parameters[3]; // padding is in words
+        // size of each indirect segment
+        const u32 indirect_words = 5 + padding;
+        const u32 stride = indirect_words * sizeof(u32);
+        const std::size_t draw_count = end_indirect - start_indirect;
+        const u32 estimate = u32(maxwell3d.EstimateIndexBufferSize());
+        maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        auto& params = maxwell3d.draw_manager.indirect_state;
+        params.is_byte_count = false;
+        params.is_indexed = true;
+        params.include_count = true;
+        params.count_start_address = maxwell3d.GetMacroAddress(4);
+        params.indirect_start_address = maxwell3d.GetMacroAddress(5);
+        params.buffer_size = stride * draw_count;
+        params.max_draw_counts = draw_count;
+        params.stride = stride;
+        maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x648, Maxwell3D::HLEReplacementAttributeType::DrawID);
+        maxwell3d.draw_manager.DrawIndexedIndirect(maxwell3d, topology, 0, estimate);
+        maxwell3d.engine_state = Maxwell3D::EngineHint::None;
+        maxwell3d.replace_table.clear();
+    } else {
+        Fallback(system, maxwell3d, parameters);
+    }
+}
+void HLE_MultiDrawIndexedIndirectCount::Fallback(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters) {
+    SCOPE_EXIT {
+        // Clean everything.
+        maxwell3d.regs.vertex_id_base = 0x0;
+        maxwell3d.engine_state = Maxwell3D::EngineHint::None;
+        maxwell3d.replace_table.clear();
+    };
+    maxwell3d.RefreshParameters();
+    const u32 start_indirect = parameters[0];
+    const u32 end_indirect = parameters[1];
+    if (start_indirect >= end_indirect) {
+        // Nothing to do.
+        return;
+    }
+    const auto topology = Maxwell3D::Regs::PrimitiveTopology(parameters[2]);
+    const u32 padding = parameters[3];
+    const std::size_t max_draws = parameters[4];
+    const u32 indirect_words = 5 + padding;
+    const std::size_t first_draw = start_indirect;
+    const std::size_t effective_draws = end_indirect - start_indirect;
+    const std::size_t last_draw = start_indirect + (std::min)(effective_draws, max_draws);
+    for (std::size_t index = first_draw; index < last_draw; index++) {
+        const std::size_t base = index * indirect_words + 5;
+        const u32 base_vertex = parameters[base + 3];
+        const u32 base_instance = parameters[base + 4];
+        maxwell3d.regs.vertex_id_base = base_vertex;
+        maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
+        maxwell3d.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
+        maxwell3d.CallMethod(system, 0x8e3, 0x648, true);
+        maxwell3d.CallMethod(system, 0x8e4, u32(index), true);
+        maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        maxwell3d.draw_manager.DrawIndex(maxwell3d, topology, parameters[base + 2], parameters[base], base_vertex, base_instance, parameters[base + 1]);
+    }
+}
+void HLE_DrawIndirectByteCount::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    const bool force = maxwell3d.Rasterizer().HasDrawTransformFeedback();
+    if (force) {
+        auto topology = Maxwell3D::Regs::PrimitiveTopology(parameters[0] & 0xFFFFU);
+        auto& params = maxwell3d.draw_manager.indirect_state;
+        params.is_byte_count = true;
+        params.is_indexed = false;
+        params.include_count = false;
+        params.count_start_address = 0;
+        params.indirect_start_address = maxwell3d.GetMacroAddress(2);
+        params.buffer_size = 4;
+        params.max_draw_counts = 1;
+        params.stride = parameters[1];
+        maxwell3d.regs.draw.begin = parameters[0];
+        maxwell3d.regs.draw_auto_stride = parameters[1];
+        maxwell3d.regs.draw_auto_byte_count = parameters[2];
+        maxwell3d.draw_manager.DrawArrayIndirect(maxwell3d, topology);
+    } else {
+        Fallback(system, maxwell3d, parameters);
+    }
+}
+void HLE_DrawIndirectByteCount::Fallback(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters) {
+    maxwell3d.RefreshParameters();
+    maxwell3d.regs.draw.begin = parameters[0];
+    maxwell3d.regs.draw_auto_stride = parameters[1];
+    maxwell3d.regs.draw_auto_byte_count = parameters[2];
+    maxwell3d.draw_manager.DrawArray(maxwell3d, maxwell3d.regs.draw.topology, 0, maxwell3d.regs.draw_auto_byte_count / maxwell3d.regs.draw_auto_stride, 0, 1);
+}
+void HLE_C713C83D8F63CCF3::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    maxwell3d.RefreshParameters();
+    const u32 offset = (parameters[0] & 0x3FFFFFFF) << 2;
+    const u32 address = maxwell3d.regs.shadow_scratch[24];
+    auto& const_buffer = maxwell3d.regs.const_buffer;
+    const_buffer.size = 0x7000;
+    const_buffer.address_high = (address >> 24) & 0xFF;
+    const_buffer.address_low = address << 8;
+    const_buffer.offset = offset;
+}
+void HLE_D7333D26E0A93EDE::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    maxwell3d.RefreshParameters();
+    const size_t index = parameters[0];
+    const u32 address = maxwell3d.regs.shadow_scratch[42 + index];
+    const u32 size = maxwell3d.regs.shadow_scratch[47 + index];
+    auto& const_buffer = maxwell3d.regs.const_buffer;
+    const_buffer.size = size;
+    const_buffer.address_high = (address >> 24) & 0xFF;
+    const_buffer.address_low = address << 8;
+}
+void HLE_BindShader::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    maxwell3d.RefreshParameters();
+    auto& regs = maxwell3d.regs;
+    const u32 index = parameters[0];
+    if ((parameters[1] - regs.shadow_scratch[28 + index]) == 0) {
+        return;
+    }
+
+    regs.pipelines[index & 0xF].offset = parameters[2];
+    maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+    regs.shadow_scratch[28 + index] = parameters[1];
+    regs.shadow_scratch[34 + index] = parameters[2];
+
+    const u32 address = parameters[4];
+    auto& const_buffer = regs.const_buffer;
+    const_buffer.size = 0x10000;
+    const_buffer.address_high = (address >> 24) & 0xFF;
+    const_buffer.address_low = address << 8;
+
+    const size_t bind_group_id = parameters[3] & 0x7F;
+    auto& bind_group = regs.bind_groups[bind_group_id];
+    bind_group.raw_config = 0x11;
+    maxwell3d.ProcessCBBind(bind_group_id);
+}
+void HLE_SetRasterBoundingBox::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    maxwell3d.RefreshParameters();
+    const u32 raster_mode = parameters[0];
+    auto& regs = maxwell3d.regs;
+    const u32 raster_enabled = maxwell3d.regs.conservative_raster_enable;
+    const u32 scratch_data = maxwell3d.regs.shadow_scratch[52];
+    regs.raster_bounding_box.raw = raster_mode & 0xFFFFF00F;
+    regs.raster_bounding_box.pad.Assign(scratch_data & raster_enabled);
+}
+void HLE_ClearConstBuffer::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    static constexpr std::array<u32, 0x7000> zeroes{}; //must be bigger than either 7000 or 5F00
+    maxwell3d.RefreshParameters();
+    auto& regs = maxwell3d.regs;
+    regs.const_buffer.size = u32(base_size);
+    regs.const_buffer.address_high = parameters[0];
+    regs.const_buffer.address_low = parameters[1];
+    regs.const_buffer.offset = 0;
+    maxwell3d.ProcessCBMultiData(zeroes.data(), parameters[2] * 4);
+}
+void HLE_ClearMemory::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    maxwell3d.RefreshParameters();
+    const u32 needed_memory = parameters[2] / sizeof(u32);
+    if (needed_memory > zero_memory.size()) {
+        zero_memory.resize(needed_memory, 0);
+    }
+    auto& regs = maxwell3d.regs;
+    regs.upload.line_length_in = parameters[2];
+    regs.upload.line_count = 1;
+    regs.upload.dest.address_high = parameters[0];
+    regs.upload.dest.address_low = parameters[1];
+    maxwell3d.CallMethod(system, size_t(MAXWELL3D_REG_INDEX(launch_dma)), 0x1011, true);
+    maxwell3d.CallMultiMethod(system, size_t(MAXWELL3D_REG_INDEX(inline_data)), zero_memory.data(), needed_memory, needed_memory);
+}
+void HLE_TransformFeedbackSetup::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    maxwell3d.RefreshParameters();
+    auto& regs = maxwell3d.regs;
+    regs.transform_feedback_enabled = 1;
+    regs.transform_feedback.buffers[0].start_offset = 0;
+    regs.transform_feedback.buffers[1].start_offset = 0;
+    regs.transform_feedback.buffers[2].start_offset = 0;
+    regs.transform_feedback.buffers[3].start_offset = 0;
+    regs.upload.line_length_in = 4;
+    regs.upload.line_count = 1;
+    regs.upload.dest.address_high = parameters[0];
+    regs.upload.dest.address_low = parameters[1];
+    maxwell3d.CallMethod(system, size_t(MAXWELL3D_REG_INDEX(launch_dma)), 0x1011, true);
+    maxwell3d.CallMethod(system, size_t(MAXWELL3D_REG_INDEX(inline_data)), regs.transform_feedback.controls[0].stride, true);
+    maxwell3d.Rasterizer().RegisterTransformFeedback(regs.upload.dest.Address());
+}
+
+#define HLE_MACRO_LIST \
+    HLE_MACRO_ELEM(0x0D61FC9FAAC9FCADULL, HLE_DrawArraysIndirect, (false)) \
+    HLE_MACRO_ELEM(0x8A4D173EB99A8603ULL, HLE_DrawArraysIndirect, (true)) \
+    HLE_MACRO_ELEM(0x771BB18C62444DA0ULL, HLE_DrawIndexedIndirect, (false)) \
+    HLE_MACRO_ELEM(0x0217920100488FF7ULL, HLE_DrawIndexedIndirect, (true)) \
+    HLE_MACRO_ELEM(0x3F5E74B9C9A50164ULL, HLE_MultiDrawIndexedIndirectCount, ()) \
+    HLE_MACRO_ELEM(0xEAD26C3E2109B06BULL, HLE_MultiLayerClear, ()) \
+    HLE_MACRO_ELEM(0xC713C83D8F63CCF3ULL, HLE_C713C83D8F63CCF3, ()) \
+    HLE_MACRO_ELEM(0xD7333D26E0A93EDEULL, HLE_D7333D26E0A93EDE, ()) \
+    HLE_MACRO_ELEM(0xEB29B2A09AA06D38ULL, HLE_BindShader, ()) \
+    HLE_MACRO_ELEM(0xDB1341DBEB4C8AF7ULL, HLE_SetRasterBoundingBox, ()) \
+    HLE_MACRO_ELEM(0x6C97861D891EDf7EULL, HLE_ClearConstBuffer, (0x5F00)) \
+    HLE_MACRO_ELEM(0xD246FDDF3A6173D7ULL, HLE_ClearConstBuffer, (0x7000)) \
+    HLE_MACRO_ELEM(0xEE4D0004BEC8ECF4ULL, HLE_ClearMemory, ()) \
+    HLE_MACRO_ELEM(0xFC0CF27F5FFAA661ULL, HLE_TransformFeedbackSetup, ()) \
+    HLE_MACRO_ELEM(0xB5F74EDB717278ECULL, HLE_DrawIndirectByteCount, ()) \
+
+// Allocates and returns a cached macro if the hash matches a known function.
+[[nodiscard]] inline AnyCachedMacro GetHLEProgram(u64 hash) noexcept {
+    // Compiler will make you a GREAT job at making an ad-hoc hash table :)
+    switch (hash) {
+#define HLE_MACRO_ELEM(HASH, TY, VAL) case HASH: return TY VAL;
+    HLE_MACRO_LIST
+#undef HLE_MACRO_ELEM
+    default: return std::monostate{};
+    }
+}
+
+void MacroInterpreterImpl::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> params, u32 method) {
+    Reset();
+
+    registers[1] = params[0];
+    parameters.resize(params.size());
+    std::memcpy(parameters.data(), params.data(), params.size() * sizeof(u32));
+
+    // Execute the code until we hit an exit condition.
+    bool keep_executing = true;
+    while (keep_executing) {
+        keep_executing = Step(system, maxwell3d, false);
+    }
+
+    // Assert the the macro used all the input parameters
+    ASSERT(next_parameter_index == parameters.size());
+}
+
+/// Resets the execution engine state, zeroing registers, etc.
+void MacroInterpreterImpl::Reset() {
+    registers = {};
+    pc = 0;
+    delayed_pc = {};
+    method_address.raw = 0;
+    // Vector must hold its last indices otherwise chaos will ensue
+    // The next parameter index starts at 1, because $r1 already has the value of the first
+    // parameter.
+    next_parameter_index = 1;
+    carry_flag = false;
+}
+
+/// @brief Executes a single macro instruction located at the current program counter. Returns whether
+/// the interpreter should keep running.
+/// @param is_delay_slot Whether the current step is being executed due to a delay slot in a previous instruction.
+bool MacroInterpreterImpl::Step(Core::System& system, Engines::Maxwell3D& maxwell3d, bool is_delay_slot) {
+    u32 base_address = pc;
+
+    Macro::Opcode opcode = GetOpcode();
+    pc += 4;
+
+    // Update the program counter if we were delayed
+    if (delayed_pc) {
+        ASSERT(is_delay_slot);
+        pc = *delayed_pc;
+        delayed_pc = {};
+    }
+
+    switch (opcode.operation) {
+    case Macro::Operation::ALU: {
+        u32 result = GetALUResult(opcode.alu_operation, GetRegister(opcode.src_a), GetRegister(opcode.src_b));
+        ProcessResult(system, maxwell3d, opcode.result_operation, opcode.dst, result);
+        break;
+    }
+    case Macro::Operation::AddImmediate: {
+        ProcessResult(system, maxwell3d, opcode.result_operation, opcode.dst, GetRegister(opcode.src_a) + opcode.immediate);
+        break;
+    }
+    case Macro::Operation::ExtractInsert: {
+        u32 dst = GetRegister(opcode.src_a);
+        u32 src = GetRegister(opcode.src_b);
+
+        src = (src >> opcode.bf_src_bit) & opcode.GetBitfieldMask();
+        dst &= ~(opcode.GetBitfieldMask() << opcode.bf_dst_bit);
+        dst |= src << opcode.bf_dst_bit;
+        ProcessResult(system, maxwell3d, opcode.result_operation, opcode.dst, dst);
+        break;
+    }
+    case Macro::Operation::ExtractShiftLeftImmediate: {
+        u32 dst = GetRegister(opcode.src_a);
+        u32 src = GetRegister(opcode.src_b);
+
+        u32 result = ((src >> dst) & opcode.GetBitfieldMask()) << opcode.bf_dst_bit;
+
+        ProcessResult(system, maxwell3d, opcode.result_operation, opcode.dst, result);
+        break;
+    }
+    case Macro::Operation::ExtractShiftLeftRegister: {
+        u32 dst = GetRegister(opcode.src_a);
+        u32 src = GetRegister(opcode.src_b);
+
+        u32 result = ((src >> opcode.bf_src_bit) & opcode.GetBitfieldMask()) << dst;
+
+        ProcessResult(system, maxwell3d, opcode.result_operation, opcode.dst, result);
+        break;
+    }
+    case Macro::Operation::Read: {
+        u32 result = Read(maxwell3d, GetRegister(opcode.src_a) + opcode.immediate);
+        ProcessResult(system, maxwell3d, opcode.result_operation, opcode.dst, result);
+        break;
+    }
+    case Macro::Operation::Branch: {
+        ASSERT_MSG(!is_delay_slot, "Executing a branch in a delay slot is not valid");
+        u32 value = GetRegister(opcode.src_a);
+        bool taken = EvaluateBranchCondition(opcode.branch_condition, value);
+        if (taken) {
+            // Ignore the delay slot if the branch has the annul bit.
+            if (opcode.branch_annul) {
+                pc = base_address + opcode.GetBranchTarget();
+                return true;
+            }
+
+            delayed_pc = base_address + opcode.GetBranchTarget();
+            // Execute one more instruction due to the delay slot.
+            return Step(system, maxwell3d, true);
+        }
+        break;
+    }
+    default:
+        UNIMPLEMENTED_MSG("Unimplemented macro operation {}", opcode.operation.Value());
+        break;
+    }
+
+    // An instruction with the Exit flag will not actually
+    // cause an exit if it's executed inside a delay slot.
+    if (opcode.is_exit && !is_delay_slot) {
+        // Exit has a delay slot, execute the next instruction
+        Step(system, maxwell3d, true);
+        return false;
+    }
+    return true;
+}
+
+/// Calculates the result of an ALU operation. src_a OP src_b;
+u32 MacroInterpreterImpl::GetALUResult(Macro::ALUOperation operation, u32 src_a, u32 src_b) {
+    switch (operation) {
+    case Macro::ALUOperation::Add: {
+        const u64 result{static_cast<u64>(src_a) + src_b};
+        carry_flag = result > 0xffffffff;
+        return static_cast<u32>(result);
+    }
+    case Macro::ALUOperation::AddWithCarry: {
+        const u64 result{static_cast<u64>(src_a) + src_b + (carry_flag ? 1ULL : 0ULL)};
+        carry_flag = result > 0xffffffff;
+        return static_cast<u32>(result);
+    }
+    case Macro::ALUOperation::Subtract: {
+        const u64 result{static_cast<u64>(src_a) - src_b};
+        carry_flag = result < 0x100000000;
+        return static_cast<u32>(result);
+    }
+    case Macro::ALUOperation::SubtractWithBorrow: {
+        const u64 result{static_cast<u64>(src_a) - src_b - (carry_flag ? 0ULL : 1ULL)};
+        carry_flag = result < 0x100000000;
+        return static_cast<u32>(result);
+    }
+    case Macro::ALUOperation::Xor:
+        return src_a ^ src_b;
+    case Macro::ALUOperation::Or:
+        return src_a | src_b;
+    case Macro::ALUOperation::And:
+        return src_a & src_b;
+    case Macro::ALUOperation::AndNot:
+        return src_a & ~src_b;
+    case Macro::ALUOperation::Nand:
+        return ~(src_a & src_b);
+
+    default:
+        UNIMPLEMENTED_MSG("Unimplemented ALU operation {}", operation);
+        return 0;
+    }
+}
+
+/// Performs the result operation on the input result and stores it in the specified register (if necessary).
+void MacroInterpreterImpl::ProcessResult(Core::System& system, Engines::Maxwell3D& maxwell3d, Macro::ResultOperation operation, u32 reg, u32 result) {
+    switch (operation) {
+    case Macro::ResultOperation::IgnoreAndFetch:
+        // Fetch parameter and ignore result.
+        SetRegister(reg, FetchParameter());
+        break;
+    case Macro::ResultOperation::Move:
+        // Move result.
+        SetRegister(reg, result);
+        break;
+    case Macro::ResultOperation::MoveAndSetMethod:
+        // Move result and use as Method Address.
+        SetRegister(reg, result);
+        SetMethodAddress(result);
+        break;
+    case Macro::ResultOperation::FetchAndSend:
+        // Fetch parameter and send result.
+        SetRegister(reg, FetchParameter());
+        Send(system, maxwell3d, result);
+        break;
+    case Macro::ResultOperation::MoveAndSend:
+        // Move and send result.
+        SetRegister(reg, result);
+        Send(system, maxwell3d, result);
+        break;
+    case Macro::ResultOperation::FetchAndSetMethod:
+        // Fetch parameter and use result as Method Address.
+        SetRegister(reg, FetchParameter());
+        SetMethodAddress(result);
+        break;
+    case Macro::ResultOperation::MoveAndSetMethodFetchAndSend:
+        // Move result and use as Method Address, then fetch and send parameter.
+        SetRegister(reg, result);
+        SetMethodAddress(result);
+        Send(system, maxwell3d, FetchParameter());
+        break;
+    case Macro::ResultOperation::MoveAndSetMethodSend:
+        // Move result and use as Method Address, then send bits 12:17 of result.
+        SetRegister(reg, result);
+        SetMethodAddress(result);
+        Send(system, maxwell3d, (result >> 12) & 0b111111);
+        break;
+    default:
+        UNIMPLEMENTED_MSG("Unimplemented result operation {}", operation);
+        break;
+    }
+}
+
+/// Evaluates the branch condition and returns whether the branch should be taken or not.
+bool MacroInterpreterImpl::EvaluateBranchCondition(Macro::BranchCondition cond, u32 value) const {
+    switch (cond) {
+    case Macro::BranchCondition::Zero:
+        return value == 0;
+    case Macro::BranchCondition::NotZero:
+        return value != 0;
+    }
+    UNREACHABLE();
+}
+
+/// Reads an opcode at the current program counter location.
+Macro::Opcode MacroInterpreterImpl::GetOpcode() const {
+    ASSERT((pc % sizeof(u32)) == 0);
+    ASSERT(pc < code.size() * sizeof(u32));
+    return {code[pc / sizeof(u32)]};
+}
+
+/// Returns the specified register's value. Register 0 is hardcoded to always return 0.
+u32 MacroInterpreterImpl::GetRegister(u32 register_id) const {
+    return registers[register_id];
+}
+
+/// Sets the register to the input value.
+void MacroInterpreterImpl::SetRegister(u32 register_id, u32 value) {
+    // Register 0 is hardwired as the zero register.
+    // Ensure no writes to it actually occur.
+    if (register_id == 0)
+        return;
+    registers[register_id] = value;
+}
+
+/// Calls a GPU Engine method with the input parameter.
+void MacroInterpreterImpl::Send(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 value) {
+    maxwell3d.CallMethod(system, method_address.address, value, true);
+    // Increment the method address by the method increment.
+    method_address.address.Assign(method_address.address.Value() + method_address.increment.Value());
+}
+
+/// Reads a GPU register located at the method address.
+u32 MacroInterpreterImpl::Read(Engines::Maxwell3D& maxwell3d, u32 method) const {
+    return maxwell3d.GetRegisterValue(method);
+}
+
+/// Returns the next parameter in the parameter queue.
+u32 MacroInterpreterImpl::FetchParameter() {
+    ASSERT(next_parameter_index < parameters.size());
+    return parameters[next_parameter_index++];
+}
+
+#ifdef ARCHITECTURE_x86_64
+namespace {
+constexpr Xbyak::Reg64 STATE = Xbyak::util::rbx;
+constexpr Xbyak::Reg32 RESULT = Xbyak::util::r10d;
+constexpr Xbyak::Reg64 MAX_PARAMETER = Xbyak::util::r11;
+constexpr Xbyak::Reg64 PARAMETERS = Xbyak::util::r12;
+constexpr Xbyak::Reg32 METHOD_ADDRESS = Xbyak::util::r14d;
+constexpr Xbyak::Reg64 BRANCH_HOLDER = Xbyak::util::r15;
+
+constexpr std::bitset<32> PERSISTENT_REGISTERS = Common::X64::BuildRegSet({
+    STATE,
+    RESULT,
+    MAX_PARAMETER,
+    PARAMETERS,
+    METHOD_ADDRESS,
+    BRANCH_HOLDER,
+});
+
+// Arbitrarily chosen based on current booting games.
+constexpr size_t MAX_CODE_SIZE = 0x10000;
+
+std::bitset<32> PersistentCallerSavedRegs() {
+    return PERSISTENT_REGISTERS & Common::X64::ABI_ALL_CALLER_SAVED;
+}
+
+/// @brief Must enforce W^X constraints, as we yet don't havea  global "NO_EXECUTE" support flag
+/// the speed loss is minimal, and in fact may be negligible, however for your peace of mind
+/// I simply included known OSes whom had W^X issues
+#if defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+static const auto default_cg_mode = Xbyak::DontSetProtectRWE;
+#else
+static const auto default_cg_mode = nullptr; //Allow RWE
+#endif
+
+struct MacroJITx64Impl final : public Xbyak::CodeGenerator, public DynamicCachedMacro {
+    explicit MacroJITx64Impl(Core::System& system, std::span<const u32> code_)
+        : Xbyak::CodeGenerator(MAX_CODE_SIZE, default_cg_mode)
+        , code{code_}
+    {
+        Compile(system);
+    }
+
+    void Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, u32 method) override;
+
+    void Compile_ALU(Core::System& system, Macro::Opcode opcode);
+    void Compile_AddImmediate(Core::System& system, Macro::Opcode opcode);
+    void Compile_ExtractInsert(Core::System& system, Macro::Opcode opcode);
+    void Compile_ExtractShiftLeftImmediate(Core::System& system, Macro::Opcode opcode);
+    void Compile_ExtractShiftLeftRegister(Core::System& system, Macro::Opcode opcode);
+    void Compile_Read(Core::System& system, Macro::Opcode opcode);
+    void Compile_Branch(Macro::Opcode opcode);
+
+    void Optimizer_ScanFlags();
+    void Compile(Core::System& system);
+    bool Compile_NextInstruction(Core::System& system);
+    Xbyak::Reg32 Compile_FetchParameter();
+    Xbyak::Reg32 Compile_GetRegister(u32 index, Xbyak::Reg32 dst);
+    void Compile_ProcessResult(Core::System& system, Macro::ResultOperation operation, u32 reg);
+    void Compile_Send(Core::System& system, Xbyak::Reg32 value);
+    Macro::Opcode GetOpCode() const;
+
+    struct JITState {
+        Engines::Maxwell3D* maxwell3d = nullptr;
+        Core::System* system = nullptr;
+        std::array<u32, Macro::NUM_MACRO_REGISTERS> registers{};
+        u32 carry_flag{};
+    };
+    static_assert(offsetof(JITState, maxwell3d) == 0, "Maxwell3D is not at 0x0");
+    using ProgramType = void (*)(JITState*, const u32*, const u32*);
+
+    struct OptimizerState {
+        bool can_skip_carry{};
+        bool has_delayed_pc{};
+        bool zero_reg_skip{};
+        bool skip_dummy_addimmediate{};
+        bool optimize_for_method_move{};
+        bool enable_asserts{};
+    };
+    OptimizerState optimizer{};
+    std::optional<Macro::Opcode> next_opcode{};
+    ProgramType program{nullptr};
+    std::array<Xbyak::Label, MAX_CODE_SIZE> labels;
+    std::array<Xbyak::Label, MAX_CODE_SIZE> delay_skip;
+    Xbyak::Label end_of_code{};
+    bool is_delay_slot{};
+    u32 pc{};
+    std::span<const u32> code;
+};
+
+void MacroJITx64Impl::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, u32 method) {
+    ASSERT_OR_EXECUTE(program != nullptr, { return; });
+    JITState state{};
+    state.maxwell3d = &maxwell3d;
+    state.system = &system;
+    state.registers = {};
+    program(&state, parameters.data(), parameters.data() + parameters.size());
+}
+
+void MacroJITx64Impl::Compile_ALU(Core::System& system, Macro::Opcode opcode) {
+    const bool is_a_zero = opcode.src_a == 0;
+    const bool is_b_zero = opcode.src_b == 0;
+    const bool valid_operation = !is_a_zero && !is_b_zero;
+    [[maybe_unused]] const bool is_move_operation = !is_a_zero && is_b_zero;
+    const bool has_zero_register = is_a_zero || is_b_zero;
+    const bool no_zero_reg_skip = opcode.alu_operation == Macro::ALUOperation::AddWithCarry ||
+                                  opcode.alu_operation == Macro::ALUOperation::SubtractWithBorrow;
+
+    Xbyak::Reg32 src_a;
+    Xbyak::Reg32 src_b;
+
+    if (!optimizer.zero_reg_skip || no_zero_reg_skip) {
+        src_a = Compile_GetRegister(opcode.src_a, RESULT);
+        src_b = Compile_GetRegister(opcode.src_b, eax);
+    } else {
+        if (!is_a_zero) {
+            src_a = Compile_GetRegister(opcode.src_a, RESULT);
+        }
+        if (!is_b_zero) {
+            src_b = Compile_GetRegister(opcode.src_b, eax);
+        }
+    }
+
+    bool has_emitted = false;
+
+    switch (opcode.alu_operation) {
+    case Macro::ALUOperation::Add:
+        if (optimizer.zero_reg_skip) {
+            if (valid_operation) {
+                add(src_a, src_b);
+            }
+        } else {
+            add(src_a, src_b);
+        }
+
+        if (!optimizer.can_skip_carry) {
+            setc(byte[STATE + offsetof(JITState, carry_flag)]);
+        }
+        break;
+    case Macro::ALUOperation::AddWithCarry:
+        bt(dword[STATE + offsetof(JITState, carry_flag)], 0);
+        adc(src_a, src_b);
+        setc(byte[STATE + offsetof(JITState, carry_flag)]);
+        break;
+    case Macro::ALUOperation::Subtract:
+        if (optimizer.zero_reg_skip) {
+            if (valid_operation) {
+                sub(src_a, src_b);
+                has_emitted = true;
+            }
+        } else {
+            sub(src_a, src_b);
+            has_emitted = true;
+        }
+        if (!optimizer.can_skip_carry && has_emitted) {
+            setc(byte[STATE + offsetof(JITState, carry_flag)]);
+        }
+        break;
+    case Macro::ALUOperation::SubtractWithBorrow:
+        bt(dword[STATE + offsetof(JITState, carry_flag)], 0);
+        sbb(src_a, src_b);
+        setc(byte[STATE + offsetof(JITState, carry_flag)]);
+        break;
+    case Macro::ALUOperation::Xor:
+        if (optimizer.zero_reg_skip) {
+            if (valid_operation) {
+                xor_(src_a, src_b);
+            }
+        } else {
+            xor_(src_a, src_b);
+        }
+        break;
+    case Macro::ALUOperation::Or:
+        if (optimizer.zero_reg_skip) {
+            if (valid_operation) {
+                or_(src_a, src_b);
+            }
+        } else {
+            or_(src_a, src_b);
+        }
+        break;
+    case Macro::ALUOperation::And:
+        if (optimizer.zero_reg_skip) {
+            if (!has_zero_register) {
+                and_(src_a, src_b);
+            }
+        } else {
+            and_(src_a, src_b);
+        }
+        break;
+    case Macro::ALUOperation::AndNot:
+        if (optimizer.zero_reg_skip) {
+            if (!is_a_zero) {
+                not_(src_b);
+                and_(src_a, src_b);
+            }
+        } else {
+            not_(src_b);
+            and_(src_a, src_b);
+        }
+        break;
+    case Macro::ALUOperation::Nand:
+        if (optimizer.zero_reg_skip) {
+            if (!is_a_zero) {
+                and_(src_a, src_b);
+                not_(src_a);
+            }
+        } else {
+            and_(src_a, src_b);
+            not_(src_a);
+        }
+        break;
+    default:
+        UNIMPLEMENTED_MSG("Unimplemented ALU operation {}", opcode.alu_operation.Value());
+        break;
+    }
+    Compile_ProcessResult(system, opcode.result_operation, opcode.dst);
+}
+
+void MacroJITx64Impl::Compile_AddImmediate(Core::System& system, Macro::Opcode opcode) {
+    if (optimizer.skip_dummy_addimmediate) {
+        // Games tend to use this as an exit instruction placeholder. It's to encode an instruction
+        // without doing anything. In our case we can just not emit anything.
+        if (opcode.result_operation == Macro::ResultOperation::Move && opcode.dst == 0) {
+            return;
+        }
+    }
+    // Check for redundant moves
+    if (optimizer.optimize_for_method_move &&
+        opcode.result_operation == Macro::ResultOperation::MoveAndSetMethod) {
+        if (next_opcode.has_value()) {
+            const auto next = *next_opcode;
+            if (next.result_operation == Macro::ResultOperation::MoveAndSetMethod &&
+                opcode.dst == next.dst) {
+                return;
+            }
+        }
+    }
+    if (optimizer.zero_reg_skip && opcode.src_a == 0) {
+        if (opcode.immediate == 0) {
+            xor_(RESULT, RESULT);
+        } else {
+            mov(RESULT, opcode.immediate);
+        }
+    } else {
+        auto result = Compile_GetRegister(opcode.src_a, RESULT);
+        if (opcode.immediate > 2) {
+            add(result, opcode.immediate);
+        } else if (opcode.immediate == 1) {
+            inc(result);
+        } else if (opcode.immediate < 0) {
+            sub(result, opcode.immediate * -1);
+        }
+    }
+    Compile_ProcessResult(system, opcode.result_operation, opcode.dst);
+}
+
+void MacroJITx64Impl::Compile_ExtractInsert(Core::System& system, Macro::Opcode opcode) {
+    auto dst = Compile_GetRegister(opcode.src_a, RESULT);
+    auto src = Compile_GetRegister(opcode.src_b, eax);
+
+    const u32 mask = ~(opcode.GetBitfieldMask() << opcode.bf_dst_bit);
+    and_(dst, mask);
+    shr(src, opcode.bf_src_bit);
+    and_(src, opcode.GetBitfieldMask());
+    shl(src, opcode.bf_dst_bit);
+    or_(dst, src);
+
+    Compile_ProcessResult(system, opcode.result_operation, opcode.dst);
+}
+
+void MacroJITx64Impl::Compile_ExtractShiftLeftImmediate(Core::System& system, Macro::Opcode opcode) {
+    const auto dst = Compile_GetRegister(opcode.src_a, ecx);
+    const auto src = Compile_GetRegister(opcode.src_b, RESULT);
+
+    shr(src, dst.cvt8());
+    and_(src, opcode.GetBitfieldMask());
+    shl(src, opcode.bf_dst_bit);
+
+    Compile_ProcessResult(system, opcode.result_operation, opcode.dst);
+}
+
+void MacroJITx64Impl::Compile_ExtractShiftLeftRegister(Core::System& system, Macro::Opcode opcode) {
+    const auto dst = Compile_GetRegister(opcode.src_a, ecx);
+    const auto src = Compile_GetRegister(opcode.src_b, RESULT);
+
+    shr(src, opcode.bf_src_bit);
+    and_(src, opcode.GetBitfieldMask());
+    shl(src, dst.cvt8());
+
+    Compile_ProcessResult(system, opcode.result_operation, opcode.dst);
+}
+
+void MacroJITx64Impl::Compile_Read(Core::System& system, Macro::Opcode opcode) {
+    if (optimizer.zero_reg_skip && opcode.src_a == 0) {
+        if (opcode.immediate == 0) {
+            xor_(RESULT, RESULT);
+        } else {
+            mov(RESULT, opcode.immediate);
+        }
+    } else {
+        auto result = Compile_GetRegister(opcode.src_a, RESULT);
+        if (opcode.immediate > 2) {
+            add(result, opcode.immediate);
+        } else if (opcode.immediate == 1) {
+            inc(result);
+        } else if (opcode.immediate < 0) {
+            sub(result, opcode.immediate * -1);
+        }
+    }
+
+    // Equivalent to Engines::Maxwell3D::GetRegisterValue:
+    if (optimizer.enable_asserts) {
+        Xbyak::Label pass_range_check;
+        cmp(RESULT, static_cast<u32>(Engines::Maxwell3D::Regs::NUM_REGS));
+        jb(pass_range_check);
+        int3();
+        L(pass_range_check);
+    }
+    mov(rax, qword[STATE + offsetof(JITState, maxwell3d)]);
+    mov(RESULT, dword[rax + offsetof(Engines::Maxwell3D, regs) + offsetof(Engines::Maxwell3D::Regs, reg_array) + RESULT.cvt64() * sizeof(u32)]);
+    Compile_ProcessResult(system, opcode.result_operation, opcode.dst);
+}
+
+static void MacroJIT_SendThunk(Core::System* system, Engines::Maxwell3D* maxwell3d, Macro::MethodAddress method_address, u32 value) {
+    maxwell3d->CallMethod(*system, method_address.address, value, true);
+}
+
+void MacroJITx64Impl::Compile_Send(Core::System& system, Xbyak::Reg32 value) {
+    Common::X64::ABI_PushRegistersAndAdjustStack(*this, PersistentCallerSavedRegs(), 0);
+    mov(Common::X64::ABI_PARAM1, qword[STATE + offsetof(JITState, system)]);
+    mov(Common::X64::ABI_PARAM2, qword[STATE + offsetof(JITState, maxwell3d)]);
+    mov(Common::X64::ABI_PARAM3.cvt32(), METHOD_ADDRESS);
+    mov(Common::X64::ABI_PARAM4.cvt32(), value);
+    Common::X64::CallFarFunction(*this, &MacroJIT_SendThunk);
+    Common::X64::ABI_PopRegistersAndAdjustStack(*this, PersistentCallerSavedRegs(), 0);
+
+    Xbyak::Label dont_process{};
+    // Get increment
+    test(METHOD_ADDRESS, 0x3f000);
+    // If zero, method address doesn't update
+    je(dont_process);
+
+    mov(ecx, METHOD_ADDRESS);
+    and_(METHOD_ADDRESS, 0xfff);
+    shr(ecx, 12);
+    and_(ecx, 0x3f);
+    lea(eax, ptr[rcx + METHOD_ADDRESS.cvt64()]);
+    sal(ecx, 12);
+    or_(eax, ecx);
+
+    mov(METHOD_ADDRESS, eax);
+
+    L(dont_process);
+}
+
+void MacroJITx64Impl::Compile_Branch(Macro::Opcode opcode) {
+    ASSERT(!is_delay_slot && "Executing a branch in a delay slot is not valid");
+    const s32 jump_address = s32(pc) + s32(opcode.GetBranchTarget() / sizeof(s32));
+
+    Xbyak::Label end;
+    auto value = Compile_GetRegister(opcode.src_a, eax);
+    cmp(value, 0); // test(value, value);
+    if (optimizer.has_delayed_pc) {
+        switch (opcode.branch_condition) {
+        case Macro::BranchCondition::Zero:
+            jne(end, T_NEAR);
+            break;
+        case Macro::BranchCondition::NotZero:
+            je(end, T_NEAR);
+            break;
+        }
+
+        if (opcode.branch_annul) {
+            xor_(BRANCH_HOLDER, BRANCH_HOLDER);
+            jmp(labels[jump_address], T_NEAR);
+        } else {
+            Xbyak::Label handle_post_exit{};
+            Xbyak::Label skip{};
+            jmp(skip, T_NEAR);
+
+            L(handle_post_exit);
+            xor_(BRANCH_HOLDER, BRANCH_HOLDER);
+            jmp(labels[jump_address], T_NEAR);
+
+            L(skip);
+            mov(BRANCH_HOLDER, handle_post_exit);
+            jmp(delay_skip[pc], T_NEAR);
+        }
+    } else {
+        switch (opcode.branch_condition) {
+        case Macro::BranchCondition::Zero:
+            je(labels[jump_address], T_NEAR);
+            break;
+        case Macro::BranchCondition::NotZero:
+            jne(labels[jump_address], T_NEAR);
+            break;
+        }
+    }
+
+    L(end);
+}
+
+void MacroJITx64Impl::Optimizer_ScanFlags() {
+    optimizer.can_skip_carry = true;
+    optimizer.has_delayed_pc = false;
+    for (auto raw_op : code) {
+        Macro::Opcode op{};
+        op.raw = raw_op;
+
+        if (op.operation == Macro::Operation::ALU) {
+            // Scan for any ALU operations which actually use the carry flag, if they don't exist in
+            // our current code we can skip emitting the carry flag handling operations
+            if (op.alu_operation == Macro::ALUOperation::AddWithCarry ||
+                op.alu_operation == Macro::ALUOperation::SubtractWithBorrow) {
+                optimizer.can_skip_carry = false;
+            }
+        }
+
+        if (op.operation == Macro::Operation::Branch) {
+            if (!op.branch_annul) {
+                optimizer.has_delayed_pc = true;
+            }
+        }
+    }
+}
+
+void MacroJITx64Impl::Compile(Core::System& system) {
+    // Matching PROTECT_RE needed for W^X systems
+    setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RW);
+    labels.fill(Xbyak::Label());
+
+    Common::X64::ABI_PushRegistersAndAdjustStack(*this, Common::X64::ABI_ALL_CALLEE_SAVED, 8);
+    // JIT state
+    mov(STATE, Common::X64::ABI_PARAM1);
+    mov(PARAMETERS, Common::X64::ABI_PARAM2);
+    mov(MAX_PARAMETER, Common::X64::ABI_PARAM3);
+    xor_(RESULT, RESULT);
+    xor_(METHOD_ADDRESS, METHOD_ADDRESS);
+    xor_(BRANCH_HOLDER, BRANCH_HOLDER);
+
+    mov(dword[STATE + offsetof(JITState, registers) + 4], Compile_FetchParameter());
+
+    // Track get register for zero registers and mark it as no-op
+    optimizer.zero_reg_skip = true;
+
+    // AddImmediate tends to be used as a NOP instruction, if we detect this we can
+    // completely skip the entire code path and no emit anything
+    optimizer.skip_dummy_addimmediate = true;
+
+    // SMO tends to emit a lot of unnecessary method moves, we can mitigate this by only emitting
+    // one if our register isn't "dirty"
+    optimizer.optimize_for_method_move = true;
+
+    // Enable run-time assertions in JITted code
+    optimizer.enable_asserts = false;
+
+    // Check to see if we can skip emitting certain instructions
+    Optimizer_ScanFlags();
+
+    const u32 op_count = static_cast<u32>(code.size());
+    for (u32 i = 0; i < op_count; i++) {
+        if (i < op_count - 1) {
+            pc = i + 1;
+            next_opcode = GetOpCode();
+        } else {
+            next_opcode = {};
+        }
+        pc = i;
+        Compile_NextInstruction(system);
+    }
+
+    L(end_of_code);
+
+    Common::X64::ABI_PopRegistersAndAdjustStack(*this, Common::X64::ABI_ALL_CALLEE_SAVED, 8);
+    ret();
+    ready();
+    setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RE);
+    program = getCode<ProgramType>();
+}
+
+bool MacroJITx64Impl::Compile_NextInstruction(Core::System& system) {
+    const auto opcode = GetOpCode();
+    if (labels[pc].getAddress()) {
+        return false;
+    }
+
+    L(labels[pc]);
+
+    switch (opcode.operation) {
+    case Macro::Operation::ALU:
+        Compile_ALU(system, opcode);
+        break;
+    case Macro::Operation::AddImmediate:
+        Compile_AddImmediate(system, opcode);
+        break;
+    case Macro::Operation::ExtractInsert:
+        Compile_ExtractInsert(system, opcode);
+        break;
+    case Macro::Operation::ExtractShiftLeftImmediate:
+        Compile_ExtractShiftLeftImmediate(system, opcode);
+        break;
+    case Macro::Operation::ExtractShiftLeftRegister:
+        Compile_ExtractShiftLeftRegister(system, opcode);
+        break;
+    case Macro::Operation::Read:
+        Compile_Read(system, opcode);
+        break;
+    case Macro::Operation::Branch:
+        Compile_Branch(opcode);
+        break;
+    default:
+        UNIMPLEMENTED_MSG("Unimplemented opcode {}", opcode.operation.Value());
+        break;
+    }
+
+    if (optimizer.has_delayed_pc) {
+        if (opcode.is_exit) {
+            mov(rax, end_of_code);
+            test(BRANCH_HOLDER, BRANCH_HOLDER);
+            cmove(BRANCH_HOLDER, rax);
+            // Jump to next instruction to skip delay slot check
+            je(labels[pc + 1], T_NEAR);
+        } else {
+            // TODO(ogniK): Optimize delay slot branching
+            Xbyak::Label no_delay_slot{};
+            test(BRANCH_HOLDER, BRANCH_HOLDER);
+            je(no_delay_slot, T_NEAR);
+            mov(rax, BRANCH_HOLDER);
+            xor_(BRANCH_HOLDER, BRANCH_HOLDER);
+            jmp(rax);
+            L(no_delay_slot);
+        }
+        L(delay_skip[pc]);
+        if (opcode.is_exit) {
+            return false;
+        }
+    } else {
+        test(BRANCH_HOLDER, BRANCH_HOLDER);
+        jne(end_of_code, T_NEAR);
+        if (opcode.is_exit) {
+            inc(BRANCH_HOLDER);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void MacroJIT_ErrorThunk(uintptr_t parameter, uintptr_t max_parameter) {
+    LOG_CRITICAL(HW_GPU, "Macro JIT: invalid parameter access {:#x} ({:#x} is the last parameter)", parameter, max_parameter - sizeof(u32));
+}
+
+Xbyak::Reg32 MacroJITx64Impl::Compile_FetchParameter() {
+    Xbyak::Label parameter_ok{};
+    cmp(PARAMETERS, MAX_PARAMETER);
+    jb(parameter_ok, T_NEAR);
+    Common::X64::ABI_PushRegistersAndAdjustStack(*this, PersistentCallerSavedRegs(), 0);
+    mov(Common::X64::ABI_PARAM1, PARAMETERS);
+    mov(Common::X64::ABI_PARAM2, MAX_PARAMETER);
+    Common::X64::CallFarFunction(*this, &MacroJIT_ErrorThunk);
+    Common::X64::ABI_PopRegistersAndAdjustStack(*this, PersistentCallerSavedRegs(), 0);
+    L(parameter_ok);
+    mov(eax, dword[PARAMETERS]);
+    add(PARAMETERS, sizeof(u32));
+    return eax;
+}
+
+Xbyak::Reg32 MacroJITx64Impl::Compile_GetRegister(u32 index, Xbyak::Reg32 dst) {
+    if (index == 0) {
+        // Register 0 is always zero
+        xor_(dst, dst);
+    } else {
+        mov(dst, dword[STATE + offsetof(JITState, registers) + index * sizeof(u32)]);
+    }
+
+    return dst;
+}
+
+void MacroJITx64Impl::Compile_ProcessResult(Core::System& system, Macro::ResultOperation operation, u32 reg) {
+    const auto SetRegister = [this](u32 reg_index, const Xbyak::Reg32& result) {
+        // Register 0 is supposed to always return 0. NOP is implemented as a store to the zero
+        // register.
+        if (reg_index == 0) {
+            return;
+        }
+        mov(dword[STATE + offsetof(JITState, registers) + reg_index * sizeof(u32)], result);
+    };
+    const auto SetMethodAddress = [this](const Xbyak::Reg32& reg32) { mov(METHOD_ADDRESS, reg32); };
+
+    switch (operation) {
+    case Macro::ResultOperation::IgnoreAndFetch:
+        SetRegister(reg, Compile_FetchParameter());
+        break;
+    case Macro::ResultOperation::Move:
+        SetRegister(reg, RESULT);
+        break;
+    case Macro::ResultOperation::MoveAndSetMethod:
+        SetRegister(reg, RESULT);
+        SetMethodAddress(RESULT);
+        break;
+    case Macro::ResultOperation::FetchAndSend:
+        // Fetch parameter and send result.
+        SetRegister(reg, Compile_FetchParameter());
+        Compile_Send(system, RESULT);
+        break;
+    case Macro::ResultOperation::MoveAndSend:
+        // Move and send result.
+        SetRegister(reg, RESULT);
+        Compile_Send(system, RESULT);
+        break;
+    case Macro::ResultOperation::FetchAndSetMethod:
+        // Fetch parameter and use result as Method Address.
+        SetRegister(reg, Compile_FetchParameter());
+        SetMethodAddress(RESULT);
+        break;
+    case Macro::ResultOperation::MoveAndSetMethodFetchAndSend:
+        // Move result and use as Method Address, then fetch and send parameter.
+        SetRegister(reg, RESULT);
+        SetMethodAddress(RESULT);
+        Compile_Send(system, Compile_FetchParameter());
+        break;
+    case Macro::ResultOperation::MoveAndSetMethodSend:
+        // Move result and use as Method Address, then send bits 12:17 of result.
+        SetRegister(reg, RESULT);
+        SetMethodAddress(RESULT);
+        shr(RESULT, 12);
+        and_(RESULT, 0b111111);
+        Compile_Send(system, RESULT);
+        break;
+    default:
+        UNIMPLEMENTED_MSG("Unimplemented macro operation {}", operation);
+        break;
+    }
+}
+
+Macro::Opcode MacroJITx64Impl::GetOpCode() const {
+    ASSERT(pc < code.size());
+    return {code[pc]};
+}
+} // Anonymous namespace
+#endif
+
+static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
+    const auto dump_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir)};
+    if (!Common::FS::CreateDir(dump_dir)) {
+        LOG_ERROR(Common_Filesystem, "Failed to create dump directory");
+        return;
+    }
+    const char* const variant_suffix = decompiled ? "jit" : "raw";
+    const auto name{dump_dir / fmt::format("{:016x}_{:016x}_{}.macro",
+                                           Settings::GetCurrentProgramID(), hash, variant_suffix)};
+
+    std::fstream macro_file(name, std::ios::out | std::ios::binary);
+    if (!macro_file) {
+        LOG_ERROR(Common_Filesystem, "Unable to open or create file at {}", Common::FS::PathToUTF8String(name));
+        return;
+    }
+    macro_file.write(reinterpret_cast<const char*>(code.data()), code.size_bytes());
+}
+
+void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
+                          std::span<const u32> parameters) {
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+    if (native_turing) {
+        // The parameters are the words the pusher fetched, as on the split front (FrontRunMacro):
+        // read again from guest memory, they are whatever reused that command memory since.
+        MeshCountProvenance::Scope count_scope{&maxwell3d, method, native_code_generation,
+                                               parameters, native_code};
+        const auto context = reinterpret_cast<std::uintptr_t>(this);
+        static std::unordered_set<std::uintptr_t> captured_contexts;
+        static const bool capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
+        if (capture && captured_contexts.insert(context).second) {
+            std::ofstream dump("native-graphics-mme-" + std::to_string(context) + ".bin", std::ios::binary);
+            dump.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
+        }
+        // EDEN_NX2_MME_LOG: log every macro call (runs ~750,000 times a second in title 1).
+        if (static const bool log_calls = std::getenv("EDEN_NX2_MME_LOG") != nullptr; log_calls) {
+            LOG_DEBUG(HW_GPU, "Native MME context={:#x}", context);
+            LOG_DEBUG(HW_GPU, "Native MME start={:#x}, parameters={}, data={:08x}", method, parameters.size(), fmt::join(parameters, ","));
+        }
+        // Reused between calls (a macro never calls another: methods >= 0xe00 are refused below);
+        // filled only for calls that are interpreted.
+        auto& fifo = native_fifo;
+        native_interpreter.active_dram = &maxwell3d.GetNativeDataRam();
+        // EDEN_NX2_MME_RECORD=<file>: write the first 200000 calls (u32 start, u32 count, the
+        // parameters) and then the macro code to <file>.code, to check interpreter changes
+        // offline against the previous interpreter. EDEN_NX2_MME_RECORD_SKIP=<n>: skip the first
+        // n calls (title 1 makes ~1,000,000 a second in 3D scenes).
+        if (static const char* const record_path = std::getenv("EDEN_NX2_MME_RECORD"); record_path != nullptr) {
+            static std::ofstream record{record_path, std::ios::binary};
+            static u32 recorded{};
+            static u64 to_skip = [] {
+                const char* value = std::getenv("EDEN_NX2_MME_RECORD_SKIP");
+                return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+            }();
+            if (to_skip > 0) {
+                --to_skip;
+            } else if (recorded < 200000) {
+                const u32 count = static_cast<u32>(parameters.size());
+                record.write(reinterpret_cast<const char*>(&method), sizeof(method));
+                record.write(reinterpret_cast<const char*>(&count), sizeof(count));
+                record.write(reinterpret_cast<const char*>(parameters.data()), parameters.size_bytes());
+                if (++recorded == 200000) {
+                    record.flush();
+                    std::ofstream code{std::string{record_path} + ".code", std::ios::binary};
+                    code.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
+                    LOG_INFO(HW_GPU, "Recorded 200000 macro calls to {}", record_path);
+                }
+            }
+        }
+        // CPU-only, marker-armed correlation of MME culling inputs and render decisions.
+        static OotCullTrace cull_trace{std::getenv("EDEN_NX2_OOT_CULL_TRACE")};
+        const u64 cull_trace_call = cull_trace.Enabled() ? cull_trace.BeginCall(
+            Core::g_nx2_present_count.load(std::memory_order_relaxed),
+            Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL) : 0;
+        // A method write of the macro (also what a remembered call replays).
+        bool read_memory = false;
+        const auto emit = [&](u32 address, u32 value) {
+                if (address >= 0xe00) return false;
+                if (address == 0x556) {
+                    // SET_RENDER_ENABLE_C (byte 0x1558): False, True, Conditional, Equal,
+                    // NotEqual. The override is a different method (byte 0x1944).
+                    static std::array<u64, 6> modes{};
+                    static u64 enable_writes{};
+                    ++modes[(std::min)(value, 5U)];
+                    if (++enable_writes % 20000 == 0) {
+                        LOG_INFO(HW_GPU, "Native MME render enable modes: false {} true {} conditional {} equal {} not_equal {} other {}",
+                                 modes[0], modes[1], modes[2], modes[3], modes[4], modes[5]);
+                    }
+                }
+                {
+                    VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
+                    maxwell3d.CallMethod(system, address, value, true);
+                }
+                if (cull_trace_call && address == 0x556) {
+                    const auto& regs = maxwell3d.regs;
+                    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                                   regs.pipelines[1].reserved[1];
+                    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                                   regs.pipelines[5].reserved[1];
+                    cull_trace.Write(cull_trace_call,
+                        Core::g_nx2_present_count.load(std::memory_order_relaxed), method,
+                        fmt::format(R"("kind":"mode","raw_mode":{},"effective_mode":{},"override":{},"host_execute":{},"predicate":"{:#x}","guest_vs":"{:#x}","guest_ps":"{:#x}","rt0":"{:#x}")",
+                            value, static_cast<u32>(regs.render_enable.mode),
+                            static_cast<u32>(regs.render_enable_override), maxwell3d.ShouldExecute(),
+                            regs.render_enable.Address(), vs, ps, regs.rt[0].Address()));
+                }
+                // Turing MME memory reads (methods 0x550 SET_MME_MEM_ADDRESS_A/B, 0x558 data RAM
+                // address, 0x55c MME_DMA_READ into data RAM, 0x560 MME_DMA_READ_FIFOED into
+                // the load FIFO, which the macro then reads after a load barrier).
+                constexpr u32 MemAddressA = 0x154, MemAddressB = 0x155, DataRamAddress = 0x156;
+                constexpr u32 DmaRead = 0x157, DmaReadFifoed = 0x158;
+                if (address == DmaRead || address == DmaReadFifoed) {
+                    read_memory = true;
+                    const GPUVAddr source = (GPUVAddr{maxwell3d.GetRegisterValue(MemAddressA) & 0x1ffffff} << 32) |
+                                            maxwell3d.GetRegisterValue(MemAddressB);
+                    auto& memory = maxwell3d.GetMemoryManager();
+                    const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
+                    // The words may have just been written by the GPU (e.g. indirect draw arguments
+                    // from a culling dispatch) and still be only in host buffers: flush them first,
+                    // or the macro draws with an older frame's arguments (objects pop in and out).
+                    const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
+                    if (VideoCommon::Nx2Profile::Enabled()) {
+                        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+                        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
+                            if (const auto device = memory.GpuToCpuAddress(page)) {
+                                VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
+                            }
+                        }
+                    }
+                    constexpr auto read_caches = VideoCommon::CacheType::BufferCache |
+                                                 VideoCommon::CacheType::QueryCache;
+                    const bool count_probe_dirty = memory.IsMemoryDirty(source, read_bytes, read_caches);
+                    if (count_probe_dirty) {
+                        VideoCommon::Nx2Profile::WaitTag wait_tag{VideoCommon::Nx2Profile::WaitSource::MmeDmaRead};
+                        memory.FlushRegion(source, read_bytes, read_caches);
+                        static u64 flushes{};
+                        if (++flushes % 2000 == 1) {
+                            LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
+                        }
+                    }
+                    // IsMemoryDirty doesn't see the query cache: write out the reports it holds,
+                    // or occlusion predicates read stale values (OoT flashes; Lichii #215).
+                    if (!VideoCommon::GpuSplit::Get().Active() ||
+                        VideoCommon::GpuSplit::OnBackThread()) {
+                        VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
+                                                            read_bytes);
+                    }
+                    static u32 dma_logs{};
+                    if (dma_logs < 400) {
+                        ++dma_logs;
+                        std::array<u32, 8> words{};
+                        for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = memory.Read<u32>(source + u64{i} * 4);
+                        LOG_INFO(HW_GPU, "Native MME DMA read{} start={:#x} source={:#x} count={} words={:08x}",
+                                 address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
+                    }
+                    // Private opt-in OOT query-visibility probe. Use the query cache's
+                    // existing flush path directly: IsMemoryDirty does not check this cache.
+                    static const bool query_probe = [] {
+                        const char* flag = std::getenv("EDEN_NX2_OOT_MME_QUERY_SYNC");
+                        return flag != nullptr && *flag != '\0' && *flag != '0';
+                    }();
+                    if (query_probe && Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
+                        method == 0x142 && value == 6 &&
+                        memory.IsFullyMappedRange(source, 6 * sizeof(u32))) {
+                        std::array<u32, 6> before{}, after{};
+                        memory.ReadWordsUnsafe(source, before.data(), before.size());
+                        memory.FlushRegion(source, sizeof(before), VideoCommon::CacheType::QueryCache);
+                        memory.ReadWordsUnsafe(source, after.data(), after.size());
+                        static u64 probe_reads{}, probe_changes{};
+                        static u32 changed_logs{};
+                        ++probe_reads;
+                        const bool changed = before != after;
+                        probe_changes += changed ? 1 : 0;
+                        const bool log_changed = changed && changed_logs < 16;
+                        if (log_changed) ++changed_logs;
+                        if (probe_reads <= 4 || log_changed) {
+                            LOG_INFO(HW_GPU,
+                                     "OOT MME query flush probe: read={} changes={} source={:#x} "
+                                     "device={:#x} before={:08x} after={:08x}",
+                                     probe_reads, probe_changes, source,
+                                     memory.GpuToCpuAddress(source).value_or(0),
+                                     fmt::join(before, ","), fmt::join(after, ","));
+                        }
+                    }
+                    const u32 word_count = std::min<u32>(value, 0x1000);
+                    // Not on the stack: 16 KiB there made every call of this lambda (each method
+                    // write of a macro) probe its stack pages (___chkstk_ms).
+                    thread_local std::array<u32, 0x1000> dma_words;
+                    memory.ReadWordsUnsafe(source, dma_words.data(), word_count);
+                    MeshCountProvenance::Get().NoteDma(&maxwell3d, source, value, ram,
+                        address == DmaReadFifoed, count_probe_dirty,
+                        std::span<const u32>{dma_words}.first(word_count));
+                    if (cull_trace_call && method == 0x142 && value == 6) {
+                        // These are the exact existing CPU words fed to the interpreter/JIT FIFO.
+                        cull_trace.Write(cull_trace_call,
+                            Core::g_nx2_present_count.load(std::memory_order_relaxed), method,
+                            fmt::format(R"("kind":"input","source":"{:#x}","device":"{:#x}","fifoed":{},"words":[{},{},{},{},{},{}])",
+                                source, memory.GpuToCpuAddress(source).value_or(0),
+                                address == DmaReadFifoed, dma_words[0], dma_words[1], dma_words[2],
+                                dma_words[3], dma_words[4], dma_words[5]));
+                    }
+                    if (address == DmaReadFifoed && fifo.empty()) {
+                        // The JIT reads the parameters in place until the FIFO grows.
+                        fifo.assign(parameters.begin(), parameters.end());
+                    }
+                    for (u32 i = 0; i < word_count; ++i) {
+                        const u32 word = dma_words[i];
+                        if (address == DmaReadFifoed) {
+                            fifo.push_back(word);
+                        } else if (ram + i < native_interpreter.active_dram->size()) {
+                            if (static const bool mme_dump = std::getenv("EDEN_NX2_MME_DUMP") != nullptr;
+                                mme_dump && ram + i == 0x27 && (*native_interpreter.active_dram)[0x27] != word) {
+                                LOG_INFO(HW_GPU, "MME data RAM[0x27] {:#x} -> {:#x} by 3D engine {} (DMA from {:#x})",
+                                         (*native_interpreter.active_dram)[0x27], word, fmt::ptr(&maxwell3d), source);
+                            }
+                            (*native_interpreter.active_dram)[ram + i] = word;
+                        }
+                    }
+                }
+                return true;
+            };
+#ifdef ARCHITECTURE_x86_64
+        // Macro code runs compiled to x86-64 (macro_turing_jit.h) instead of through the memo
+        // and the interpreter; EDEN_NX2_MME_JIT=0 goes back to those.
+        static const bool use_jit = [] {
+            const char* value = std::getenv("EDEN_NX2_MME_JIT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (use_jit) {
+            if (!native_jit) {
+                native_jit = std::make_shared<TuringMacroJit>();
+            }
+            native_jit->Prepare(native_code, native_code_generation);
+            // Parameters are read in place: copying them for every call (millions a second) cost
+            // ~1.7% of the GPU thread. The emit copies them when the macro appends to the FIFO.
+            fifo.clear();
+            const auto result = native_jit->Execute(
+                method, parameters, fifo, std::span<u32>{*native_interpreter.active_dram},
+                [&](u32 address) {
+                    return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
+                },
+                emit);
+            if (!result.success) {
+                native_execution_failed = true;
+                if (fifo.empty()) {
+                    fifo.assign(parameters.begin(), parameters.end());
+                }
+                const DmaPusher::MacroFaultDiagnostic fault{
+                    .start = method, .pc = 0, .consumed = result.consumed,
+                    .code_generation = native_code_generation,
+                    .memory_registers = {maxwell3d.GetRegisterValue(0x154),
+                                         maxwell3d.GetRegisterValue(0x155),
+                                         maxwell3d.GetRegisterValue(0x156)},
+                    .parameters = parameters, .fifo = fifo, .code = native_code,
+                    .data_ram = *native_interpreter.active_dram,
+                };
+                DmaPusher::CaptureCurrentPushbufferFault("native-mme-jit-failure-pc-unavailable", &fault);
+                LOG_ERROR(HW_GPU, "Native MME (JIT) failed: start={:#x}, consumed={}/{}, error={}",
+                          method, result.consumed, parameters.size(), result.error);
+            }
+            return;
+        }
+#endif
+        // EDEN_NX2_MME_MEMO=0: interpret every call (see macro_memo.h).
+        static const bool use_memo = [] {
+            const char* value = std::getenv("EDEN_NX2_MME_MEMO");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (use_memo) {
+            // EDEN_NX2_MME_MEMO_STATS: log the memo's counters every 2^24 calls.
+            if (static const bool memo_stats = std::getenv("EDEN_NX2_MME_MEMO_STATS") != nullptr;
+                memo_stats && (++native_calls & 0xffffff) == 0) {
+                const auto& stats = native_memo.GetStatistics();
+                LOG_INFO(HW_GPU,
+                         "Macro memo: {} hits ({} on the last call's slot), {} misses, {} guard "
+                         "failures, {} stores ({} in place), {} compactions, {} clears; {} entries, "
+                         "{} KiB",
+                         stats.hits, stats.slot_hits, stats.misses, stats.guard_failures, stats.stores,
+                         stats.overwrites, stats.compactions, stats.clears, native_memo.Size(),
+                         native_memo.ArenaWords() * 4 / 1024);
+            }
+            native_memo.Synchronize(native_code_generation);
+            if (decltype(native_memo)::Effects effects;
+                native_memo.Find(method, parameters, *native_interpreter.active_dram, effects)) {
+                auto& data_ram = *native_interpreter.active_dram;
+                for (size_t i = 0; i < effects.data_ram_writes.size(); i += 2) {
+                    data_ram[effects.data_ram_writes[i]] = effects.data_ram_writes[i + 1];
+                }
+                for (size_t i = 0; i < effects.writes.size(); i += 2) {
+                    emit(effects.writes[i], effects.writes[i + 1]);
+                }
+                return;
+            }
+            native_writes.clear();
+        }
+        fifo.assign(parameters.begin(), parameters.end());
+        const u64 code_generation = native_code_generation;
+        const auto result = native_interpreter.Execute(native_code, method, fifo,
+            [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
+            [&](u32 address, u32 value) {
+                if (use_memo) {
+                    native_writes.emplace_back(address, value);
+                }
+                return emit(address, value);
+            });
+        // Remember the call if its effects depend only on its parameters and the data RAM words
+        // it read (and the macro code did not change under it).
+        if (use_memo && result.success && !read_memory && !native_interpreter.read_registers &&
+            !native_interpreter.reread_data_ram && code_generation == native_code_generation) {
+            native_memo.Store(method, parameters, native_interpreter.data_ram_reads,
+                              native_interpreter.data_ram_writes, native_writes);
+        }
+        if (!result.success) {
+            native_execution_failed = true;
+            const DmaPusher::MacroFaultDiagnostic fault{
+                .start = method, .pc = result.pc, .consumed = result.consumed,
+                .code_generation = native_code_generation,
+                .memory_registers = {maxwell3d.GetRegisterValue(0x154),
+                                     maxwell3d.GetRegisterValue(0x155),
+                                     maxwell3d.GetRegisterValue(0x156)},
+                .parameters = parameters, .fifo = fifo, .code = native_code,
+                .data_ram = *native_interpreter.active_dram,
+            };
+            DmaPusher::CaptureCurrentPushbufferFault("native-mme-interpreter-failure", &fault);
+            if (static const bool diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+                diagnostics) {
+                std::ofstream dump("native-mme-" + std::to_string(method) + ".bin", std::ios::binary);
+                dump.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
+            }
+            LOG_ERROR(HW_GPU, "Native MME failed: start={:#x}, pc={:#x}, consumed={}/{}, error={}",
+                      method, result.pc, result.consumed, parameters.size(), result.error);
+        }
+        return;
+    }
+    const auto execute_variant = [&system, &maxwell3d, &parameters,
+                                  method](AnyCachedMacro& cached) {
+        if (std::holds_alternative<MacroInterpreterImpl>(cached) ||
+            std::holds_alternative<std::unique_ptr<DynamicCachedMacro>>(cached) ||
+            Settings::values.disable_macro_hle) {
+            maxwell3d.RefreshParameters();
+        }
+
+        if (auto program = std::get_if<HLE_DrawArraysIndirect>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_DrawIndexedIndirect>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_MultiDrawIndexedIndirectCount>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_MultiLayerClear>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_C713C83D8F63CCF3>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_D7333D26E0A93EDE>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_BindShader>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_SetRasterBoundingBox>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_ClearConstBuffer>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_ClearMemory>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_TransformFeedbackSetup>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<HLE_DrawIndirectByteCount>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<MacroInterpreterImpl>(&cached))
+            return program->Execute(system, maxwell3d, parameters, method);
+        if (auto program = std::get_if<std::unique_ptr<DynamicCachedMacro>>(&cached))
+            return program->get()->Execute(system, maxwell3d, parameters, method);
+
+        UNREACHABLE();
+    };
+    if (auto const it = macro_cache.find(method); it != macro_cache.end()) {
+        execute_variant(it->second.program);
+        return;
+    }
+
+    // Macro not compiled, check if it's uploaded and if so, compile it
+    std::span<const u32> code;
+    auto macro_code = uploaded_macro_code.find(method);
+    if (macro_code == uploaded_macro_code.end()) {
+        std::optional<u32> mid_method;
+        for (const auto& [method_base, uploaded_code] : uploaded_macro_code) {
+            if (method >= method_base && (method - method_base) < uploaded_code.size()) {
+                mid_method = method_base;
+                break;
+            }
+        }
+        if (!mid_method) {
+            ASSERT_MSG(false, "Macro 0x{0:x} was not uploaded", method);
+            return;
+        }
+
+        const auto source = uploaded_macro_code.find(*mid_method);
+        ASSERT(source != uploaded_macro_code.end());
+        const auto rebased_method = method - *mid_method;
+        std::vector<u32> rebased_code(source->second.begin() + rebased_method,
+                                      source->second.end());
+        const auto [it, inserted] = uploaded_macro_code.emplace(method, std::move(rebased_code));
+        ASSERT(inserted);
+        code = it->second;
+    } else {
+        code = macro_code->second;
+    }
+
+    auto& ci = macro_cache[method];
+    ci.hash = Common::HashRange(code.begin(), code.end());
+    if (!Settings::values.disable_macro_hle) {
+        ci.program = GetHLEProgram(ci.hash);
+    }
+    if (std::holds_alternative<std::monostate>(ci.program)) {
+        ci.program = Compile(system, maxwell3d, code);
+    }
+
+    execute_variant(ci.program);
+    if (Settings::values.dump_macros) {
+        Dump(ci.hash, code, !std::holds_alternative<std::monostate>(ci.program));
+    }
+}
+
+AnyCachedMacro MacroEngine::Compile(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> code) {
+#ifdef ARCHITECTURE_x86_64
+    if (!is_interpreted)
+        return std::make_unique<MacroJITx64Impl>(system, code);
+#endif
+    return MacroInterpreterImpl(code);
+}
+
+} // namespace Tegra

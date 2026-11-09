@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="256" height="256" viewBox="0 0 256 256">
+  <!-- SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project -->
+  <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+  <!-- Eglantine: a sweet-briar rose on a raspberry tile. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff3d6e"/>
+      <stop offset="1" stop-color="#a3124d"/>
+    </linearGradient>
+    <radialGradient id="petal" cx="0.5" cy="0.85" r="0.9">
+      <stop offset="0" stop-color="#ffd3e0"/>
+      <stop offset="0.55" stop-color="#ffffff"/>
+    </radialGradient>
+    <radialGradient id="heart" cx="0.45" cy="0.4" r="0.6">
+      <stop offset="0" stop-color="#ffe680"/>
+      <stop offset="1" stop-color="#f2a900"/>
+    </radialGradient>
+    <path id="p" d="M128 128 C 96 104, 92 58, 128 40 C 164 58, 160 104, 128 128 Z"/>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <rect x="8" y="8" width="240" height="120" rx="56" fill="#ffffff" opacity="0.08"/>
+  <g fill="url(#petal)" stroke="#d81b5c" stroke-opacity="0.25" stroke-width="2">
+    <use xlink:href="#p" transform="rotate(0 128 128)"/>
+    <use xlink:href="#p" transform="rotate(72 128 128)"/>
+    <use xlink:href="#p" transform="rotate(144 128 128)"/>
+    <use xlink:href="#p" transform="rotate(216 128 128)"/>
+    <use xlink:href="#p" transform="rotate(288 128 128)"/>
+  </g>
+  <circle cx="128" cy="128" r="24" fill="url(#heart)"/>
+  <g fill="#c77700">
+    <circle cx="128" cy="116" r="3"/>
+    <circle cx="139" cy="124" r="3"/>
+    <circle cx="135" cy="138" r="3"/>
+    <circle cx="121" cy="138" r="3"/>
+    <circle cx="117" cy="124" r="3"/>
+  </g>
+</svg>

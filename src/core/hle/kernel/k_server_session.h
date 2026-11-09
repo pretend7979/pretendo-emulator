@@ -1,0 +1,96 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <list>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "common/intrusive_list.h"
+
+#include "core/hle/kernel/k_light_lock.h"
+#include "core/hle/kernel/k_session_request.h"
+#include "core/hle/kernel/k_synchronization_object.h"
+#include "core/hle/result.h"
+
+namespace Service {
+class HLERequestContext;
+class SessionRequestManager;
+} // namespace Service
+
+namespace Kernel {
+
+class KernelCore;
+class KEvent;
+class KSession;
+class KThread;
+
+class KServerSession final : public KSynchronizationObject,
+                             public Common::IntrusiveListBaseNode<KServerSession> {
+    KERNEL_AUTOOBJECT_TRAITS(KServerSession, KSynchronizationObject);
+
+    friend class ServiceThread;
+
+public:
+    explicit KServerSession(KernelCore& kernel);
+    ~KServerSession() override;
+
+    void Destroy(KernelCore& kernel) override;
+
+    void Initialize(KSession* p) {
+        m_parent = p;
+    }
+
+    const KSession* GetParent() const {
+        return m_parent;
+    }
+
+    bool IsSignaled(KernelCore& kernel) const override;
+    void OnClientClosed(KernelCore& kernel);
+
+    /// For an HLE server: sets an event to signal once the client closes, so that the server
+    /// notices the close while it holds a request deferred and does not wait on the session.
+    /// The session holds a reference to the event until it is replaced or the session dies.
+    void SetClientClosedEvent(KernelCore& kernel, KEvent* event);
+
+    Result OnRequest(KernelCore& kernel, KSessionRequest* request);
+    Result SendReply(KernelCore& kernel, uintptr_t server_message, uintptr_t server_buffer_size,
+                     KPhysicalAddress server_message_paddr, bool is_hle = false, bool session_closed = false);
+    Result ReceiveRequest(KernelCore& kernel, uintptr_t server_message, uintptr_t server_buffer_size,
+                          KPhysicalAddress server_message_paddr,
+                          std::shared_ptr<Service::HLERequestContext>* out_context = nullptr,
+                          std::weak_ptr<Service::SessionRequestManager> manager = {});
+
+    Result SendReplyHLE(KernelCore& kernel, bool session_closed = false) {
+        R_RETURN(this->SendReply(kernel, 0, 0, 0, true, session_closed));
+    }
+
+    Result ReceiveRequestHLE(KernelCore& kernel, std::shared_ptr<Service::HLERequestContext>* out_context,
+                             std::weak_ptr<Service::SessionRequestManager> manager) {
+        R_RETURN(this->ReceiveRequest(kernel, 0, 0, 0, out_context, manager));
+    }
+
+private:
+    /// Frees up waiting client sessions when this server session is about to die
+    void CleanupRequests(KernelCore& kernel);
+
+    /// KSession that owns this KServerSession
+    KSession* m_parent{};
+
+    /// List of threads which are pending a reply.
+    using RequestList = Common::IntrusiveListBaseTraits<KSessionRequest>::ListType;
+    RequestList m_request_list{};
+    KSessionRequest* m_current_request{};
+
+    /// Signaled once the client closes; guarded by m_lock.
+    KEvent* m_client_closed_event{};
+
+    KLightLock m_lock;
+};
+
+} // namespace Kernel

@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- SPDX-FileCopyrightText: Copyright 2026 PreTenDo Emulator contributors -->
+  <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+  <!-- PreTenDo Emulator app icon: the console from the logo (dist/pretendo-logo.png),
+       a teal and a purple controller around a black screen with a white P in a red swoosh. -->
+  <defs>
+    <linearGradient id="teal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4ffcee"/>
+      <stop offset="0.3" stop-color="#22efd8"/>
+      <stop offset="1" stop-color="#00d4b4"/>
+    </linearGradient>
+    <linearGradient id="purple" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d651f2"/>
+      <stop offset="0.3" stop-color="#b52ef0"/>
+      <stop offset="1" stop-color="#9a12e4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Black outline around the whole console -->
+  <rect x="4" y="34" width="248" height="188" rx="60" fill="#000"/>
+
+  <!-- Left controller: stick on top, buttons below -->
+  <path d="M72 46 H62 A48 48 0 0 0 14 94 V162 A48 48 0 0 0 62 210 H68 Z" fill="url(#teal)"/>
+  <circle cx="43" cy="90" r="15" fill="#000"/>
+  <circle cx="43" cy="90" r="9.5" fill="#2a2a2a"/>
+  <g fill="#000">
+    <circle cx="43" cy="137" r="6.5"/>
+    <circle cx="43" cy="165" r="6.5"/>
+    <circle cx="29" cy="151" r="6.5"/>
+    <circle cx="57" cy="151" r="6.5"/>
+  </g>
+
+  <!-- Right controller: buttons on top, stick below -->
+  <path d="M184 46 H194 A48 48 0 0 1 242 94 V162 A48 48 0 0 1 194 210 H188 Z" fill="url(#purple)"/>
+  <g fill="#000">
+    <circle cx="213" cy="76" r="6.5"/>
+    <circle cx="213" cy="104" r="6.5"/>
+    <circle cx="199" cy="90" r="6.5"/>
+    <circle cx="227" cy="90" r="6.5"/>
+  </g>
+  <circle cx="213" cy="152" r="15" fill="#000"/>
+  <circle cx="213" cy="152" r="9.5" fill="#2a2a2a"/>
+
+  <!-- Screen with its grey bezel and the P -->
+  <rect x="78" y="50" width="100" height="156" rx="14" fill="#000" stroke="#4a4a4a" stroke-width="4"/>
+  <!-- A tilted ring around the P: its back half behind the letter... -->
+  <ellipse cx="128" cy="136" rx="44" ry="13" transform="rotate(-24 128 136)" fill="none"
+           stroke="#fd1f25" stroke-width="6"/>
+  <g fill="#fd1f25">
+    <rect x="150" y="66" width="9" height="9"/>
+    <rect x="161" y="58" width="9" height="9"/>
+    <rect x="161" y="77" width="7" height="7"/>
+  </g>
+  <rect x="143" y="76" width="6" height="6" fill="#fff"/>
+  <path fill="#fff" fill-rule="evenodd"
+        d="M94 80 A6 6 0 0 1 100 74 H134 A29 29 0 0 1 134 132 H118 V176 A6 6 0 0 1 112 182 H100
+           A6 6 0 0 1 94 176 Z
+           M118 92 V114 H133 A11 11 0 0 0 133 92 Z"/>
+  <!-- ...and its front half across the stem. -->
+  <path d="M84 136 A44 13 0 0 0 150 147.3" transform="rotate(-24 128 136)" fill="none"
+        stroke="#fd1f25" stroke-width="6" stroke-linecap="round"/>
+</svg>
